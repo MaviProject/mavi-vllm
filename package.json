@@ -1,0 +1,1 @@
+{"name":"mavi-vllm-platform","version":"1.0.0","private":true,"scripts":{"test:ui":"node tests/frontend.cjs"},"devDependencies":{"jsdom":"26.1.0"}}

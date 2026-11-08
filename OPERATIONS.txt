@@ -1,0 +1,88 @@
+mavi_vllm管理平台
+
+管理入口：http://<Ubuntu实际IP>:20204/；Ubuntu 本机也可使用 http://127.0.0.1:20204/。
+用户名：admin
+初始密码：admin（同样保存在交付目录中的 admin-credentials.json）。
+API 地址：http://<Ubuntu实际IP>/v1（HTTP 80）。
+当前模型名：liuxing
+API 客户端使用 model=liuxing。请求使用旧模型名时会返回 HTTP 404。
+原有 API Key 已保留，可在平台的“API 访问”页查看、复制、停用或新增。
+
+功能
+- 密码登录、会话过期、CSRF 防护、登录失败限流、修改密码并退出旧会话。
+- 启动、停止和重启推理。停止模型会释放 GPU 显存，管理平台保持在线。
+- 保留 1/2/4/8 并发快捷配置，也支持手动输入 1–8 的任意整数并发数；切换并发自动填入上下文建议。
+- 上下文可直接输入整数 token，不要求 1024 的倍数，例如 3 并发 / 5001 token；最小 1024，最大值由该并发下的容量校验决定。
+- 自定义并发参考相邻档位容量估算，超出上限会在网页和服务端被拒绝；小上下文测量不会覆盖较大上下文的容量参考。
+- 模型名与多 API Key 即时生效，无需重载权重。
+- 关闭思考时，网关强制覆盖请求中的思考开关及 reasoning_effort；拒绝自定义模板。
+- 为保证强制关闭思考策略，原始 /v1/completions 在该模式下不可用；请用 Chat Completions 或 Responses。
+- 性能、请求次数、成功率、延迟、Token 用量、流式首字延迟、MTP 接受率、GPU/CPU/内存与 KV 缓存监控。
+- SQLite 持久存储请求和管理操作，不记录提示词、图片或完整 API Key；密钥加密保存。
+- 流式图文调试、服务日志、管理操作记录、请求 CSV 导出。
+- 网页调试按当前上下文保留输出空间；1K 档位默认最多生成 256 token。
+- 已配置管理平台、API 网关、推理服务开机自启。Ubuntu 图形桌面登录后自动打开浏览器。
+- 网页请求、导航和下载使用相对地址；API 地址、复制内容和调用示例按当前浏览器访问地址生成。IP 更改后用新 IP 打开页面即可，无需修改程序、重新加载模型或更换 API Key。
+- 桌面自启使用回环地址，不受局域网 IP 更改影响。不同 IP 属于不同浏览器站点，换 IP 后可能需要重新登录；账号、模型设置和统计保留。
+- 原有外部客户端/SSH 配置中的旧 IP 是部署时快照，主机更换 IP 后需相应修改连接地址；网络路由和防火墙应允许新地址的 20204/80 端口。
+- 网关限制在途请求与队列长度，队满返回 429 和 Retry-After；请求体上限 25MB，读取期限 30 秒，超限返回 413/408。
+- 单请求仅支持一个候选；拒绝 n/best_of 扩展、beam search 与批量 prompt，避免绕过并发限制。
+- 显式输出上限参数最高 4096 token，且不能大于当前上下文。流式取消会关闭上游连接并释放入口名额。
+- 推理自动重启间隔 15 秒，连续失败最多 3 次/10 分钟；修复配置后在平台手动启动会清除失败限制。
+
+当前运行配置
+- 双并发、12,288 token 上下文。
+- 快捷档位上限：1 并发 24K，2 并发 12K，4 并发 6K，8 并发 1K（K=1024）。自定义 3/5/6/7 并发按这些档位的总上下文预算插值，并结合 KV 实测收紧；网页显示实际可填写范围。
+- 8 并发曾按每路 2K 进行压力验证，但实测 KV 不足以为八路全部用满 2K 保留缓冲，因此交付上限采用每路 1K。
+- 视觉与 MTP 开启。每个请求最多 1 张图片，图像预处理上限约 100 万像素。
+- 上下文不足 4K 时，图像上限按上下文预算自动降低（1K 时约 26 万像素），为图像 token、文字和输出留出空间；大图细节理解建议使用默认双并发 12K。
+- 思考默认强制关闭，可在“推理配置”页允许按请求开启。
+- 并发/上下文变更需要重载模型，通常约 1–2 分钟。
+- 管理页面监听 0.0.0.0:20204；API 网关监听 0.0.0.0:80；原生 vLLM 仅监听 127.0.0.1:8000。
+- 使用 0.90 显存预算、1024 token 分块预填充和 eager 模式；GGUF 加载期间将待合并分片暂存系统内存，减少冷启动峰值。
+
+服务与文件
+程序目录：/home/mavi/mavi-vllm-platform
+数据库与私密配置：/home/mavi/mavi-vllm-platform/data
+模型权重：/home/mavi/inference/models/liuxing
+GGUF 文件：liuxing-UD-Q4_K_M.gguf、mmproj-liuxing-BF16.gguf、mtp-liuxing-Q4_0.gguf
+管理服务：mavi-vllm-platform.service
+API 网关：mavi-vllm-gateway.service
+推理进程：qwen3.8-vllm.service
+桌面自启：/home/mavi/.config/autostart/mavi-vllm-platform.desktop
+原推理单元备份：/home/mavi/mavi-vllm-platform/backups/qwen3.8-vllm.original.service
+
+维护
+ssh ubuntu-mavi "systemctl status mavi-vllm-platform mavi-vllm-gateway qwen3.8-vllm --no-pager"
+ssh ubuntu-mavi "journalctl -u mavi-vllm-platform -n 100 --no-pager"
+ssh ubuntu-mavi "journalctl -u mavi-vllm-gateway -n 100 --no-pager"
+ssh ubuntu-mavi "journalctl -u qwen3.8-vllm -n 100 --no-pager"
+
+测试
+后端隔离测试：/home/mavi/inference/venv-vllm/bin/python tests/test_platform.py
+量化加载一致性测试：/home/mavi/inference/venv-vllm/bin/python tests/test_loader_memory.py
+前端 DOM 交互测试：npm run test:ui（开发环境，npm ci 后运行）
+真实模型集成验收：data/integration-validation.json。
+最终复验停止后显存从 22,593 MiB 降至 215 MiB，管理平台继续在线；重启后两路并发均成功。
+已验证模型别名、多 Key 即时撤销、强制关闭思考、图像理解、SSE 用量记录、取消统计及 CSV 导出。
+最终稳定性证据：data/production-qa/stability-results.json、stability-summary.json、gateway-edge-cases.json。
+自定义并发/上下文的增量验收：data/production-qa/custom-settings-validation.json（3×5001 与 5×1501 的真实图文并发测试）。
+持续测试命令：python tests/production_stability.py --soak-seconds 1200。该命令会重载模型并产生测试调用，应在维护时运行。
+完整档位矩阵：python tests/production_stability.py --matrix --soak-seconds 1200；包含模型多次重载，应在维护窗口运行。
+真实内嵌浏览器因已保存权限/管理策略拒绝该地址读取，未完成实际点击与截图验收；不得把 DOM 自动化或接口测试记为人工网页通过。
+统计保留验收请求，包括故意产生的 400/408/413/429 和取消记录；请结合测试 Key 名称与审计时间区分实际业务错误。
+
+生产使用边界
+默认 admin/admin 与 HTTP 按需求保留，仅适合可信局域网；对外生产接入前应修改密码并部署 HTTPS。
+本次验收覆盖单机、指定模型、单图约 1MP、MTP 和已测并发/上下文；不代表无限运行或任意其他 GPU 程序共同占用时均无 OOM。
+为推理保留整张 GPU；其他程序增加显存占用后应降低配置并重新验证。
+固定本次通过测试的运行库与插件补丁，升级 vLLM、PyTorch、插件或驱动后需重新验收。
+vLLM 官方仍将 GGUF 支持标为实验性且可能存在特性兼容限制；本机通过有限压测不等于任意负载和长期运行的稳定性保证。
+数据库备份需要同时保存 data/platform.sqlite3 与 data/secret.key；正在运行时使用 SQLite backup API，不能仅复制一个活动的 WAL 主文件。
+交付包含运行版本清单、插件兼容补丁、内存优化补丁及实际通过测试的插件 Python 源码，便于恢复。
+
+实现参考
+vLLM 官方监控指标：https://docs.vllm.ai/en/latest/design/metrics/
+vLLM 官方 GGUF 支持范围：https://docs.vllm.ai/en/latest/features/quantization/gguf/
+Open WebUI 的 OpenAI 兼容连接管理：https://docs.openwebui.com/getting-started/quick-start/connect-a-provider/starting-with-openai-compatible/
+平台为针对本机的独立实现，未引入 Open WebUI 的服务依赖。
