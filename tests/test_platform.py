@@ -1,342 +1,520 @@
-import asyncio
+"""Exercise the shipped backend binaries against a local fake vLLM."""
+import hashlib
+import http.client
 import json
 import os
-import sqlite3
-import runpy
-import sys
-import tempfile
-import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+import shutil
+import socket
+import sqlite3
+import subprocess
+import tempfile
+import threading
+import time
+import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-tmp=tempfile.TemporaryDirectory()
-root=Path(tmp.name)
-(root/'static').mkdir()
-(root/'static/index.html').write_text('test')
-os.environ['MAVI_PLATFORM_ROOT']=str(root)
-os.environ['MAVI_EXISTING_API_ENV']=str(root/'no-existing-env')
-sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'backend'))
-import core
-import main
-import gateway
-import httpx
-from fastapi.testclient import TestClient
-from starlette.requests import Request
 
-async def idle():
-    while True:await asyncio.sleep(60)
+ROOT = Path(__file__).resolve().parents[1]
+BACKEND = Path(os.environ.get("MAVI_BACKEND_BINARY", ROOT / "build/mavi-backend")).resolve()
+CHAT = "/v1/chat/completions"
+
+
+def eventually(check, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        result = check()
+        if result:
+            return result
+        time.sleep(.025)
+    raise AssertionError("Timed out waiting for condition")
+
+
+def free_port():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def request(port, method, path, body=None, headers=None):
+    headers = dict(headers or {})
+    if isinstance(body, dict):
+        body = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=6)
+    try:
+        conn.request(method, path, body, headers)
+        response = conn.getresponse()
+        result = response.read()
+        if response.getheader("Content-Type", "").startswith("application/json"):
+            result = json.loads(result)
+        return response.status, result, dict(response.getheaders())
+    finally:
+        conn.close()
+
+
+class FakeEngine(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def reply(self, body=b"", content_type="application/json"):
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/health" and self.server.health_failures:
+            self.server.health_failures -= 1
+            self.close_connection = True
+            return
+        if self.path == "/metrics":
+            if self.server.metrics_error:
+                self.close_connection = True
+                return
+            metrics = (
+                f'vllm:cache_config_info{{kv_cache_size_tokens="{self.server.kv}"}} 1\n'
+                "vllm:prompt_tokens_total 10\n"
+                "vllm:generation_tokens_total 2\n"
+            )
+            self.reply(metrics.encode(), "text/plain")
+        else:
+            self.reply()
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        self.server.calls.append((body, self.headers["Authorization"]))
+        if body.get("hold"):
+            self.connection.settimeout(5)
+            try:
+                if not self.connection.recv(1, socket.MSG_PEEK):
+                    self.server.closed.append(body["hold"])
+            except OSError:
+                pass
+            self.close_connection = True
+            return
+        usage = {"prompt_tokens": 5, "completion_tokens": 1}
+        if not body.get("stream"):
+            self.reply(json.dumps({"model": "liuxing", "usage": usage}).encode())
+            return
+        if self.path == "/v1/responses":
+            events = [
+                {"type": "response.output_text.delta", "delta": "hello"},
+                {"type": "response.completed", "response": {
+                    "model": "liuxing", "usage": {"input_tokens": 5, "output_tokens": 1}}},
+            ]
+        else:
+            events = [{"model": "liuxing", "choices": [{"delta": {"content": "hello"}}]},
+                      {"model": "liuxing", "choices": [], "usage": usage}]
+        if body.get("sse_error"):
+            events.insert(1, {"error": {"message": "mock failure"}})
+        data = "".join("data: " + json.dumps(event) + "\r\n\r\n" for event in events)
+        if self.path != "/v1/responses" and not body.get("truncated"):
+            data += "data: [DONE]\r\n\r\n"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        # Exercise split CRLF and a JSON frame split over multiple HTTP chunks.
+        split = data.index("\r\n") + 1
+        for block in (data[:13], data[13:split], data[split:]):
+            payload = block.encode()
+            self.wfile.write(f"{len(payload):x}\r\n".encode() + payload + b"\r\n")
+        self.wfile.write(b"0\r\n\r\n")
+
 
 class PlatformTests(unittest.TestCase):
     def setUp(self):
-        core.initialize()
-        self.password=json.loads((root/'data/bootstrap-credentials.json').read_text())['password']
-        self.mon=patch('main.monitor',idle);self.mon.start()
-        self.ctrl=patch('main.control',AsyncMock());self.control=self.ctrl.start()
-        self.client=TestClient(main.app);self.client.__enter__()
-        login=self.client.post('/api/login',json={'username':'admin','password':self.password})
-        self.assertEqual(login.status_code,200)
-        self.headers={'X-CSRF-Token':login.json()['csrf']}
-        with core.connect() as c:c.execute('DELETE FROM login_attempts')
-    def tearDown(self):
-        self.client.__exit__(None,None,None);self.mon.stop();self.ctrl.stop()
+        self.assertTrue(BACKEND.is_file(), f"Build the backend first: {BACKEND}")
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.db = self.root / "data/platform.sqlite3"
+        shutil.copytree(ROOT / "static", self.root / "static")
+        fake = ThreadingHTTPServer(("127.0.0.1", 0), FakeEngine)
+        self.addCleanup(fake.server_close)
+        thread = threading.Thread(target=fake.serve_forever, kwargs={"poll_interval": .025}, daemon=True)
+        thread.start()
+        self.addCleanup(fake.shutdown)
+        fake.calls, fake.closed = [], []
+        fake.health_failures, fake.metrics_error, fake.kv = 1, False, 36864
+        self.fake = fake
+        control = self.root / "systemctl"
+        control.write_text(
+            '#!/bin/sh\n'
+            'if [ "$1" = show ]; then printf "ActiveState=active\\nSubState=running\\nNRestarts=0\\n"; exit; fi\n'
+            'printf "%s\\n" "$1" >> "$MAVI_PLATFORM_ROOT/control.log"\n'
+            'if [ "$1" = restart ] && [ -e "$MAVI_PLATFORM_ROOT/fail-restart" ]; then exit 1; fi\n'
+        )
+        control.chmod(0o755)
+        self.admin_port, self.gateway_port = free_port(), free_port()
+        while self.gateway_port == self.admin_port:
+            self.gateway_port = free_port()
+        self.env = {**os.environ, "MAVI_PLATFORM_ROOT": str(self.root),
+                    "MAVI_EXISTING_API_ENV": str(self.root / "missing.env"), "MAVI_BIND_ADDRESS": "127.0.0.1",
+                    "MAVI_ADMIN_PORT": str(self.admin_port), "MAVI_GATEWAY_PORT": str(self.gateway_port),
+                    "MAVI_UPSTREAM_PORT": str(fake.server_port), "MAVI_SYSTEMCTL": str(control),
+                    "MAVI_SUDO": "", "MAVI_NVIDIA_SMI": "/bin/false"}
+        self.start_backend("admin", self.admin_port, "/api/health", self.env)
+        self.start_backend("gateway", self.gateway_port, "/health", self.env)
+        self.auth = self.login()
+        status, self.key, _ = self.admin("POST", "/keys", {"name": "test key"})
+        self.assertEqual(status, 200)
+        self.bearer = {"Authorization": "Bearer " + self.key["value"]}
 
-    def test_auth_and_csrf(self):
-        anon=TestClient(main.app)
-        self.assertEqual(anon.get('/api/overview').status_code,401)
-        self.assertEqual(self.client.post('/api/control/stop').status_code,403)
-        self.assertEqual(self.client.post('/api/control/stop',headers=self.headers).status_code,200)
-        self.control.assert_awaited_with('stop')
+    def start_backend(self, mode, port, health, env):
+        process = subprocess.Popen([str(BACKEND), mode], env=env)
+        self.addCleanup(self.stop_backend, process)
+        self.wait_for_backend(process, port, health)
 
-    def test_login_and_sessions_follow_current_host(self):
-        for origin in ('http://192.168.50.88:20204','http://10.23.45.67:20204','http://mavi-server.local:20204','http://127.0.0.2:20204'):
-            client=TestClient(main.app,base_url=origin)
+    def wait_for_backend(self, process, port, health):
+        def ready():
+            if process.poll() is not None:
+                self.fail(f"Backend exited with {process.returncode}")
             try:
-                r=client.post('/api/login',headers={'Origin':origin},json={'username':'admin','password':self.password})
-                self.assertEqual(r.status_code,200,(origin,r.text))
-                self.assertEqual(client.get('/api/session').status_code,200)
-                self.assertEqual(client.get('/api/overview').status_code,200)
-                self.assertEqual(client.get('/api/export').status_code,200)
-                rejected=client.post('/api/login',headers={'Origin':'http://different-host.invalid:20204'},json={'username':'admin','password':self.password})
-                self.assertEqual(rejected.status_code,403)
-            finally:client.close()
+                return request(port, "GET", health)[0] == 200
+            except (OSError, http.client.HTTPException):
+                return False
 
-    def test_database_connections_close_and_roll_back(self):
-        with core.connect() as connection:
-            connection.execute('SELECT 1')
-        with self.assertRaises(sqlite3.ProgrammingError):connection.execute('SELECT 1')
-        with self.assertRaises(RuntimeError):
-            with core.connect() as connection:
-                connection.execute("INSERT INTO meta VALUES ('rollback-test','true')")
-                raise RuntimeError('abort transaction')
-        self.assertIsNone(core.get_meta('rollback-test'))
+        eventually(ready)
 
-    def test_short_context_launcher_reserves_image_space(self):
-        previous=core.get_meta('applied_config')
-        try:
-            for n,context,pixels in ((8,1024,262144),(3,1537,393216),(2,12288,1048576)):
-                cfg={**core.config(),'concurrency':n,'context_length':context}
-                with patch('core.config',return_value=cfg),patch('os.execv') as launch,patch.dict(os.environ):
-                    runpy.run_path(str(Path(__file__).resolve().parents[1]/'backend/engine_launcher.py'))
-                arguments=launch.call_args.args[1]
-                self.assertEqual(Path(arguments[2]),core.MODEL_DIR/core.MODEL_WEIGHT)
-                loader=json.loads(arguments[arguments.index('--model-loader-extra-config')+1])
-                self.assertEqual(Path(loader['mm_proj']),core.MODEL_DIR/core.VISION_WEIGHT)
-                mm=json.loads(arguments[arguments.index('--mm-processor-kwargs')+1])
-                self.assertEqual(mm['size']['longest_edge'],pixels)
-                self.assertEqual(core.get_meta('applied_config')['image_max_pixels'],pixels)
-        finally:core.set_meta('applied_config',previous)
+    @staticmethod
+    def stop_backend(process):
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
 
-    def test_playground_header_disconnect_closes_upstream(self):
-        upstream=httpx.Response(200,headers={'content-type':'text/event-stream'},stream=BytesStream([b'data: {}\n\n']))
-        async def handler(request):return upstream
-        self.client.app.state.client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
-        async def exercise():
-            scope={'type':'http','method':'POST','path':'/api/playground','headers':[],'app':main.app,'asgi':{'spec_version':'2.4'}}
-            async def receive():return {'type':'http.request','body':b'{}','more_body':False}
-            response=await main.playground(Request(scope,receive),s={})
-            async def send(message):raise asyncio.CancelledError()
-            with self.assertRaises(asyncio.CancelledError):await response(scope,receive,send)
-        asyncio.run(exercise());self.assertTrue(upstream.is_closed)
+    def login(self, headers=None, password="admin", port=None):
+        status, result, response_headers = request(port or self.admin_port, "POST", "/api/login",
+            {"username": "admin", "password": password}, headers)
+        self.assertEqual(status, 200, result)
+        self.assertIn("HttpOnly", response_headers["Set-Cookie"])
+        return {"Cookie": response_headers["Set-Cookie"].split(";")[0], "X-CSRF-Token": result["csrf"]}
 
-    def test_password_invalidates_old_session(self):
-        old=TestClient(main.app)
-        old.cookies.update(self.client.cookies)
-        new='Temporary_Test_password_38'
-        r=self.client.post('/api/password',headers=self.headers,json={'current_password':self.password,'new_password':new})
-        self.assertEqual(r.status_code,200)
-        self.assertEqual(old.get('/api/session').status_code,401)
-        self.headers={'X-CSRF-Token':r.json()['csrf']}
-        with core.connect() as c:c.execute('UPDATE users SET password=? WHERE username=?',(core.password_hash(self.password),'admin'))
+    def admin(self, method, path, body=None):
+        return request(self.admin_port, method, "/api" + path, body, self.auth)
 
-    def test_failed_login_rate_limited(self):
-        anon=TestClient(main.app)
-        for _ in range(10):self.assertEqual(anon.post('/api/login',json={'username':'admin','password':'wrong'}).status_code,401)
-        self.assertEqual(anon.post('/api/login',json={'username':'admin','password':'wrong'}).status_code,429)
-        with core.connect() as c:c.execute('DELETE FROM login_attempts')
+    def gateway(self, body, path=CHAT):
+        return request(self.gateway_port, "POST", path, body, self.bearer)
 
-    def test_key_lifecycle_and_encryption(self):
-        r=self.client.post('/api/keys',headers=self.headers,json={'name':'unit test'})
-        self.assertEqual(r.status_code,200);data=r.json()
-        self.assertIsNotNone(core.lookup_key(data['value']))
-        self.assertEqual(self.client.get('/api/keys/'+data['id']+'/reveal').json()['value'],data['value'])
-        with core.connect() as c:
-            row=c.execute('SELECT encrypted FROM api_keys WHERE id=?',(data['id'],)).fetchone()
-        self.assertNotIn(data['value'],row['encrypted'])
-        self.client.patch('/api/keys/'+data['id'],headers=self.headers,json={'enabled':False})
-        self.assertIsNone(core.lookup_key(data['value']))
-        self.client.delete('/api/keys/'+data['id'],headers=self.headers)
+    def overview(self):
+        return self.admin("GET", "/overview")[1]
 
-    def test_capacity_recommendations_and_settings(self):
-        p=self.client.get('/api/recommendations').json()['profiles']
-        self.assertEqual([x['concurrency'] for x in p],[1,2,4,8])
-        self.assertTrue(all(p[i]['context_length']>=p[i+1]['context_length'] for i in range(3)))
-        cfg=core.config();bad={**cfg,'concurrency':8,'context_length':32768}
-        self.assertEqual(self.client.post('/api/settings',headers=self.headers,json=bad).status_code,400)
-        changed={**cfg,'served_model_name':'mavi-test-model'}
-        self.assertEqual(self.client.post('/api/settings',headers=self.headers,json=changed).status_code,200)
-        self.assertEqual(core.config()['served_model_name'],'mavi-test-model')
-        core.set_meta('config',cfg)
-        self.assertEqual(p[-1]['max_context'],1024)
-        core.set_meta('capacity_profiles',{'4':{'kv_tokens':16000}})
-        constrained=next(x for x in core.recommendations()['profiles'] if x['concurrency']==4)
-        self.assertLessEqual(constrained['max_context']*4,16000*.85)
-        core.set_meta('capacity_profiles',{})
+    def sql(self, statement, params=()):
+        with sqlite3.connect(self.db, timeout=2) as db:
+            return db.execute(statement, params).fetchall()
 
-    def test_pending_settings_apply_from_applied_state(self):
-        cfg=core.config();old_state=main.CACHE['state']
-        core.set_meta('applied_config',{'concurrency':1,'context_length':8192})
-        main.CACHE['state']='running'
-        changed={**cfg,'concurrency':2,'context_length':4096,'apply_restart':False}
-        self.assertEqual(self.client.post('/api/settings',headers=self.headers,json=changed).status_code,200)
-        self.control.assert_not_awaited()
-        changed['apply_restart']=True
-        self.assertEqual(self.client.post('/api/settings',headers=self.headers,json=changed).status_code,200)
-        self.control.assert_awaited_with('restart')
-        core.set_meta('config',cfg);main.CACHE['state']=old_state
+    def meta(self, key, value):
+        self.sql("INSERT OR REPLACE INTO meta VALUES (?,?)", (key, json.dumps(value)))
 
-    def test_custom_concurrency_and_exact_context_persist(self):
-        original=core.config()
-        try:
-            result=self.client.get('/api/recommendations').json()
-            self.assertEqual([p['concurrency'] for p in result['custom_profiles']],list(range(1,9)))
-            for n,context in ((3,5001),(5,2501),(6,2049),(7,1031)):
-                changed={**original,'concurrency':n,'context_length':context,'apply_restart':False}
-                r=self.client.post('/api/settings',headers=self.headers,json=changed)
-                self.assertEqual(r.status_code,200,r.text)
-                saved=self.client.get('/api/overview').json()['config']
-                self.assertEqual((saved['concurrency'],saved['context_length']),(n,context))
-                too_large={**changed,'context_length':core.capacity_profile(n)['max_context']+1}
-                self.assertEqual(self.client.post('/api/settings',headers=self.headers,json=too_large).status_code,400)
-                self.assertEqual(core.config(),saved)
-            self.control.assert_not_awaited()
-        finally:core.set_meta('config',original)
+    def last_request(self):
+        return self.sql("SELECT status,outcome,input_tokens,output_tokens,ttft_ms FROM requests ORDER BY created DESC LIMIT 1")[0]
 
-    def test_custom_values_require_integers_and_safe_ranges(self):
-        cfg=core.config()
-        for field,values in (('concurrency',(0,9,2.5,True)),('context_length',(1023,32769,5001.5,True))):
+    def test_auth_origin_csrf_and_session_rotation(self):
+        status, html, headers = request(self.admin_port, "GET", "/")
+        self.assertEqual(status, 200)
+        self.assertIn(b"/static/app.js", html)
+        self.assertIn("Content-Security-Policy", headers)
+        self.assertEqual(request(self.admin_port, "GET", "/api/overview")[0], 401)
+        host = f"new-host.test:{self.admin_port}"
+        self.login({"Host": host, "Origin": f"http://{host}"})
+        credentials = {"username": "admin", "password": "admin"}
+        self.assertEqual(request(self.admin_port, "POST", "/api/login", credentials,
+                                 {"Host": host, "Origin": "http://old-host.test"})[0], 403)
+        stale = self.auth
+        self.assertEqual(request(self.admin_port, "POST", "/api/logout", headers={"Cookie": stale["Cookie"]})[0], 403)
+        self.assertEqual(self.admin("POST", "/password", {"current_password": "admin", "new_password": "new password"})[0], 200)
+        self.assertEqual(self.admin("GET", "/session")[0], 401)
+        self.auth = self.login(password="new password")
+        self.assertEqual(self.admin("POST", "/logout")[0], 200)
+        self.assertEqual(self.admin("GET", "/session")[0], 401)
+
+    def test_login_rate_limit(self):
+        for _ in range(10):
+            self.assertEqual(request(self.admin_port, "POST", "/api/login",
+                             {"username": "admin", "password": "wrong"})[0], 401)
+        self.assertEqual(request(self.admin_port, "POST", "/api/login",
+                         {"username": "admin", "password": "admin"})[0], 429)
+
+    def test_key_lifecycle(self):
+        path = "/keys/" + self.key["id"]
+        self.assertEqual(self.admin("GET", path + "/reveal")[1]["value"], self.key["value"])
+        encrypted, = self.sql("SELECT encrypted FROM api_keys WHERE id=?", (self.key["id"],))[0]
+        self.assertNotIn(self.key["value"], encrypted)
+        self.assertEqual(request(self.gateway_port, "GET", "/v1/models")[0], 401)
+        self.assertEqual(request(self.gateway_port, "GET", "/v1/models",
+                         headers={"X-API-Key": self.key["value"]})[0], 200)
+        self.assertEqual(self.admin("PATCH", path, {"enabled": False})[0], 200)
+        self.assertEqual(self.gateway({"model": "liuxing"})[0], 401)
+        self.assertEqual(self.admin("DELETE", path)[0], 200)
+
+    def test_capacity_and_settings(self):
+        cfg = self.overview()["config"]
+        recommendations = self.admin("GET", "/recommendations")[1]
+        self.assertEqual([p["concurrency"] for p in recommendations["profiles"]], [1, 2, 4, 8])
+        profiles = {p["concurrency"]: p for p in recommendations["custom_profiles"]}
+        self.assertEqual(list(profiles), list(range(1, 9)))
+        self.assertEqual(profiles[8]["max_context"], 1024)
+        for n, context in ((3, 5001), (5, 2501), (6, 2049), (7, 1031)):
+            data = dict(cfg, concurrency=n, context_length=context, apply_restart=False)
+            self.assertEqual(self.admin("POST", "/settings", data)[0], 200)
+            saved = self.overview()["config"]
+            self.assertEqual((saved["concurrency"], saved["context_length"]), (n, context))
+            self.assertEqual(self.admin("POST", "/settings", dict(data, context_length=profiles[n]["max_context"] + 1))[0], 400)
+            self.assertEqual(self.overview()["config"], saved)
+        for field, values in (("concurrency", (0, 9, 2.5, True)), ("context_length", (1023, 32769, 5001.5, True))):
             for value in values:
-                r=self.client.post('/api/settings',headers=self.headers,json={**cfg,field:value})
-                self.assertEqual(r.status_code,422,(field,value,r.text))
-        self.assertEqual(core.config(),cfg)
+                self.assertEqual(self.admin("POST", "/settings", {**cfg, field: value})[0], 422)
 
-    def test_small_context_measurement_preserves_capacity_reference(self):
-        old_calibration=core.get_meta('calibration');old_profiles=core.get_meta('capacity_profiles',{})
+    def test_pending_settings_and_restart_rollback(self):
+        view = eventually(lambda: (view := self.overview())["runtime"]["state"] == "running" and view)
+        old = view["config"]
+        self.meta("applied_config", {"concurrency": 1, "context_length": 8192})
+        pending = dict(old, concurrency=2, context_length=4096, apply_restart=False)
+        control = self.root / "control.log"
+        self.assertTrue(self.admin("POST", "/settings", pending)[1]["restart"])
+        self.assertFalse(control.exists())
+        (self.root / "fail-restart").touch()
+        failed = self.admin("POST", "/settings", dict(pending, context_length=2048, autostart_inference=False, apply_restart=True))
+        self.assertEqual(failed[0], 500)
+        self.assertEqual(self.overview()["config"]["context_length"], 4096)
+        self.assertEqual(control.read_text().splitlines(), ["disable", "reset-failed", "restart", "enable"])
+        (self.root / "fail-restart").unlink()
+        self.assertEqual(self.admin("POST", "/settings", dict(pending, apply_restart=True))[0], 200)
+        self.assertEqual(control.read_text().splitlines()[-2:], ["reset-failed", "restart"])
+        self.assertEqual(self.admin("POST", "/control/stop")[1]["state"], "stopping")
+
+    def test_metrics_failure_keeps_healthy_state_and_capacity_reference(self):
+        view = eventually(lambda: (v := self.overview())["runtime"].get("kv_tokens") and v)
+        tick = view["runtime"]["updated"]
+        self.assertEqual(self.fake.health_failures, 0)
+        self.meta("applied_config", {"concurrency": 2, "context_length": 1024})
+        self.fake.kv = 10000
+        def small_context_calibration():
+            view = self.overview()
+            return view if view["runtime"]["updated"] > tick and view["runtime"].get("kv_tokens") == 10000 else None
+
+        view = eventually(small_context_calibration, timeout=7)
+        profiles = json.loads(self.sql("SELECT value FROM meta WHERE key='capacity_profiles'")[0][0])
+        self.assertEqual(profiles["2"]["kv_tokens"], 36864)
+        tick = view["runtime"]["updated"]
+        self.fake.metrics_error = True
+        view = eventually(lambda: (v := self.overview())["runtime"]["updated"] > tick and v, timeout=7)
+        self.assertEqual(view["runtime"]["state"], "running")
+        self.assertEqual(view["runtime"]["kv_tokens"], 10000)
+        self.assertEqual(view["runtime"]["metrics"]["vllm:prompt_tokens_total"], 10)
+
+    def test_chart_retains_hour_and_csv_export(self):
+        tick = time.time()
+        with sqlite3.connect(self.db, timeout=2) as db:
+            db.executemany("INSERT INTO samples VALUES (?,?)",
+                ((ts, json.dumps({"created": ts, "output_tps": 1})) for ts in (tick - 3595 + 5 * i for i in range(720))))
+        history = self.overview()["history"]
+        self.assertLess(history[0]["created"], tick - 3000)
+        self.assertGreaterEqual(history[-1]["created"], tick - 5)
+        self.gateway({"model": "liuxing"})
+        status, csv, _ = self.admin("GET", "/export")
+        self.assertEqual(status, 200)
+        self.assertTrue(csv.startswith(b"\xef\xbb\xbfid,created"))
+        self.assertIn(b"test key,/v1/chat/completions,liuxing,200,success", csv)
+
+    def test_policy_alias_and_legacy_routes(self):
+        cfg = self.overview()["config"]
+        self.assertEqual(self.admin("POST", "/settings", dict(cfg, served_model_name="unit-model"))[0], 200)
+        status, body, _ = self.gateway({"model": "unit-model", "reasoning_effort": "high",
+                                       "chat_template_kwargs": {"enable_thinking": True}})
+        self.assertEqual((status, body["model"]), (200, "unit-model"))
+        upstream, auth = self.fake.calls[-1]
+        self.assertEqual(upstream["model"], "liuxing")
+        self.assertEqual(upstream["reasoning_effort"], "none")
+        self.assertFalse(upstream["chat_template_kwargs"]["enable_thinking"])
+        self.assertTrue(auth.startswith("Bearer sk-internal-"))
+        self.assertEqual(self.gateway({"model": "liuxing"})[0], 404)
+        self.assertEqual(self.gateway({"model": "unit-model"}, "/v1/completions")[0], 400)
+        self.assertEqual(self.gateway({"model": "unit-model"}, "/invocations")[0], 404)
+        self.assertEqual(self.gateway({"model": "unit-model", "reasoning": {"effort": "high"}}, "/v1/responses")[0], 200)
+        self.assertEqual(self.fake.calls[-1][0]["reasoning"], {"effort": "none"})
+        self.assertEqual(self.admin("POST", "/settings", dict(cfg, thinking_enabled=True))[0], 200)
+        self.assertEqual(self.gateway({"model": "liuxing", "prompt": [1, 2]}, "/v1/completions")[0], 200)
+        self.assertEqual(self.gateway({"model": "liuxing", "prompt": ["a", "b"]}, "/v1/completions")[0], 400)
+
+    def test_invalid_payloads_and_body_limits(self):
+        for extra in ({"stream": "false"}, {"stream_options": True}, {"stream_options": {"include_usage": "yes"}},
+                      {"chat_template_kwargs": []}, {"n": 100}, {"n": True}, {"best_of": 10},
+                      {"use_beam_search": True}, {"beam_width": 8}, {"max_tokens": 999999}):
+            self.assertEqual(self.gateway({"model": "liuxing", **extra})[0], 400, extra)
+        self.assertEqual(self.gateway(b'{"model":"liuxing","temperature":NaN}')[0], 400)
+        status, _, _ = request(self.gateway_port, "POST", CHAT, b"",
+                               {**self.bearer, "Content-Length": str(26 * 1024 * 1024)})
+        self.assertEqual(status, 413)
+        status, _, _ = request(self.admin_port, "POST", "/api/login", b"",
+                               {"Content-Length": str(17 * 1024)})
+        self.assertEqual(status, 413)
+        conn = http.client.HTTPConnection("127.0.0.1", self.gateway_port, timeout=8)
         try:
-            core.record_calibration(dict(concurrency=4,context_length=6144,kv_tokens=28964))
-            core.record_calibration(dict(concurrency=4,context_length=1501,kv_tokens=10000))
-            self.assertEqual(core.get_meta('calibration')['context_length'],1501)
-            self.assertEqual(core.get_meta('capacity_profiles')['4']['kv_tokens'],28964)
-            self.assertEqual(core.capacity_profile(4)['max_context'],6144)
+            conn.putrequest("POST", CHAT)
+            conn.putheader("Transfer-Encoding", "chunked")
+            conn.putheader("Authorization", self.bearer["Authorization"])
+            conn.endheaders()
+            chunk = b"x" * (1024 * 1024)
+            for _ in range(25):
+                conn.send(b"100000\r\n" + chunk + b"\r\n")
+            conn.send(b"1\r\n")
+            self.assertEqual(conn.getresponse().status, 413)
         finally:
-            core.set_meta('calibration',old_calibration);core.set_meta('capacity_profiles',old_profiles)
+            conn.close()
+        self.assertEqual(self.last_request()[:2], (413, "error"))
+        self.assertEqual(self.gateway({"model": "liuxing", "stream_options": None, "chat_template_kwargs": None})[0], 200)
 
-    def test_chart_retains_full_hour(self):
-        import time
-        now=time.time()
-        with core.connect() as c:
-            for i in range(720):
-                ts=now-3595+i*5
-                c.execute('INSERT OR REPLACE INTO samples VALUES (?,?)',(ts,json.dumps({'created':ts,'output_tps':1})))
-        history=core.usage_stats()['history']
-        self.assertLess(history[0]['created'],now-3000)
-        self.assertGreaterEqual(history[-1]['created'],now-5)
-        with core.connect() as c:c.execute('DELETE FROM samples')
+    def test_streaming_usage_responses_and_playground(self):
+        body = {"model": "liuxing", "stream": True}
+        status, data, headers = self.gateway(body)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "text/event-stream")
+        self.assertIn(b"data: [DONE]", data)
+        self.assertNotIn(b"prompt_tokens", data)
+        self.assertTrue(self.fake.calls[-1][0]["stream_options"]["include_usage"])
+        self.assertEqual(self.last_request()[:4], (200, "success", 5, 1))
+        self.assertGreater(self.last_request()[4], 0)
+        self.assertEqual(self.gateway(dict(body, sse_error=True))[0], 200)
+        self.assertEqual(self.last_request()[1], "error")
+        self.assertEqual(self.gateway(dict(body, truncated=True))[0], 200)
+        self.assertEqual(self.last_request()[1], "error")
+        status, data, _ = self.gateway(body, "/v1/responses")
+        self.assertEqual(status, 200)
+        self.assertIn(b"response.completed", data)
+        self.assertEqual(self.last_request()[:4], (200, "success", 5, 1))
+        status, data, _ = self.admin("POST", "/playground", dict(body, stream_options={"include_usage": True}))
+        self.assertEqual(status, 200)
+        self.assertIn(b"prompt_tokens", data)
 
-    def test_metrics_timeout_does_not_mark_healthy_engine_loading(self):
-        class Probe:
-            async def get(self,url,**kwargs):
-                if url.endswith('/health'):return httpx.Response(200)
-                raise httpx.ReadTimeout('metrics timeout')
-            async def aclose(self):pass
-        async def fake_command(*args,**kwargs):
-            if args[0]=='nvidia-smi':return 'RTX 4090,595.99.02,22000,24564,90,65,300'
-            return 'ActiveState=active\nSubState=running\nNRestarts=0'
-        async def stop(*args):raise asyncio.CancelledError()
-        old=main.CACHE.copy();main.CACHE.update(metrics={'vllm:prompt_tokens_total':100},kv_tokens=12345)
-        self.mon.stop()
+    def open_pending(self, port, path, headers, hold):
+        body = json.dumps({"model": "liuxing", "stream": True, "hold": hold}).encode()
+        conn = socket.create_connection(("127.0.0.1", port), timeout=5)
+        self.addCleanup(conn.close)
+        head = f"POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {len(body)}\r\n"
+        for name, value in headers.items():
+            head += f"{name}: {value}\r\n"
+        conn.sendall(head.encode() + b"\r\n" + body)
+        return conn
+
+    def test_admission_and_disconnect_before_headers(self):
+        sockets = [self.open_pending(self.gateway_port, CHAT, self.bearer, index + 1) for index in range(8)]
+        eventually(lambda: len(self.fake.calls) == 8)
+        status, _, headers = self.gateway({"model": "liuxing"})
+        self.assertEqual((status, headers["Retry-After"]), (429, "3"))
+        for sock in sockets:
+            sock.close()
+        eventually(lambda: len(self.fake.closed) == 8)
+        eventually(lambda: self.sql("SELECT COUNT(*) FROM requests WHERE outcome='cancelled'")[0][0] == 8)
+        self.assertEqual(self.gateway({"model": "liuxing"})[0], 200)
+
+    def test_playground_disconnect_propagates(self):
+        conn = self.open_pending(self.admin_port, "/api/playground", self.auth, 1)
+        eventually(lambda: len(self.fake.calls) == 1)
+        conn.close()
+        eventually(lambda: self.fake.closed == [1])
+        eventually(lambda: self.last_request()[:2] == (499, "cancelled") if self.sql("SELECT 1 FROM requests") else False)
+
+    def test_engine_launcher_exec_and_context(self):
+        cfg = dict(self.overview()["config"], concurrency=8, context_length=1024, apply_restart=False)
+        self.assertEqual(self.admin("POST", "/settings", cfg)[0], 200)
+        inference = self.root / "inference"
+        launcher = inference / "venv-vllm/bin/vllm"
+        launcher.parent.mkdir(parents=True)
+        launcher.write_text("#!/usr/bin/python3\nimport json,os,sys\n"
+                            "print(json.dumps({'args':sys.argv[1:],'key':os.environ['VLLM_API_KEY'].startswith('sk-internal-')}))\n")
+        launcher.chmod(0o755)
+        result = subprocess.run([str(BACKEND), "engine"], env={**self.env, "MAVI_INFERENCE_ROOT": str(inference)},
+                                check=True, capture_output=True, text=True)
+        payload = json.loads(result.stdout)
+        args = payload["args"]
+        self.assertTrue(payload["key"])
+        self.assertEqual(args[args.index("--max-model-len") + 1], "1024")
+        self.assertEqual(args[args.index("--max-num-seqs") + 1], "8")
+        self.assertEqual(json.loads(args[args.index("--mm-processor-kwargs") + 1])["size"]["longest_edge"], 262144)
+        self.assertEqual(self.overview()["applied"], {"concurrency": 8, "context_length": 1024, "image_max_pixels": 262144})
+
+    def test_python_database_compatibility(self):
         try:
-            with patch('main.httpx.AsyncClient',return_value=Probe()),patch('main.command',fake_command),patch('main.asyncio.sleep',stop):
-                with self.assertRaises(asyncio.CancelledError):asyncio.run(main.monitor())
-            self.assertEqual(main.CACHE['state'],'running')
-            self.assertEqual(main.CACHE['kv_tokens'],12345)
-            self.assertEqual(main.CACHE['metrics']['vllm:prompt_tokens_total'],100)
-        finally:
-            main.CACHE.clear();main.CACHE.update(old);self.mon.start()
+            from cryptography.fernet import Fernet
+        except ImportError:
+            self.skipTest("Python cryptography is needed for legacy Fernet interoperability")
+        root = self.root / "legacy"
+        data = root / "data"
+        data.mkdir(parents=True)
+        key = Fernet.generate_key()
+        cipher = Fernet(key)
+        (data / "secret.key").write_bytes(key)
+        old_key = "sk-legacy-integration"
+        internal = "sk-internal-legacy"
+        token = "old-cookie-token"
+        sha = lambda value: hashlib.sha256(value.encode()).hexdigest()
+        salt = bytes(range(16))
+        password = "legacy password"
+        pwd = hashlib.scrypt(password.encode(), salt=salt, n=16384, r=8, p=1).hex()
+        with sqlite3.connect(data / "platform.sqlite3") as db:
+            db.executescript("""
+                CREATE TABLE meta (key TEXT PRIMARY KEY,value TEXT NOT NULL);
+                CREATE TABLE users (username TEXT PRIMARY KEY,password TEXT NOT NULL);
+                CREATE TABLE sessions (token TEXT PRIMARY KEY,csrf TEXT NOT NULL,expires REAL NOT NULL);
+                CREATE TABLE api_keys (id TEXT PRIMARY KEY,name TEXT NOT NULL,digest TEXT UNIQUE NOT NULL,
+                  encrypted TEXT NOT NULL,tail TEXT NOT NULL,enabled INTEGER NOT NULL,created REAL NOT NULL,last_used REAL);
+            """)
+            db.executemany("INSERT INTO meta VALUES (?,?)", [
+                ("keys_initialized", "true"), ("internal_key", json.dumps(cipher.encrypt(internal.encode()).decode())),
+                ("config", json.dumps(dict(self.overview()["config"], served_model_name="legacy-model")))])
+            db.execute("INSERT INTO users VALUES (?,?)", ("admin", salt.hex() + ":" + pwd))
+            db.execute("INSERT INTO sessions VALUES (?,?,?)", (sha(token), "old-csrf", time.time() + 60))
+            db.execute("INSERT INTO api_keys VALUES (?,?,?,?,?,?,?,NULL)",
+                       ("old", "old key", sha(old_key), cipher.encrypt(old_key.encode()).decode(), "tion", 1, time.time()))
+        admin, gateway = free_port(), free_port()
+        while gateway == admin:
+            gateway = free_port()
+        env = {**self.env, "MAVI_PLATFORM_ROOT": str(root), "MAVI_ADMIN_PORT": str(admin), "MAVI_GATEWAY_PORT": str(gateway)}
+        self.start_backend("admin", admin, "/api/health", env)
+        self.start_backend("gateway", gateway, "/health", env)
+        self.assertEqual(request(admin, "GET", "/api/session", headers={"Cookie": "mavi_session=" + token})[1]["csrf"], "old-csrf")
+        auth = self.login(password=password, port=admin)
+        self.assertEqual(request(admin, "GET", "/api/keys/old/reveal", headers=auth)[1]["value"], old_key)
+        status, result, _ = request(gateway, "POST", CHAT, {"model": "legacy-model"},
+                                    {"Authorization": "Bearer " + old_key})
+        self.assertEqual((status, result["model"]), (200, "legacy-model"))
+        self.assertEqual(self.fake.calls[-1][1], "Bearer " + internal)
+        added = request(admin, "POST", "/api/keys", {"name": "native key"}, auth)[1]
+        with sqlite3.connect(data / "platform.sqlite3") as db:
+            sealed, = db.execute("SELECT encrypted FROM api_keys WHERE id=?", (added["id"],)).fetchone()
+        self.assertEqual(cipher.decrypt(sealed.encode()).decode(), added["value"])
+        self.assertEqual((data / "secret.key").read_bytes(), key)
 
-    def test_health_transport_retry_and_persistent_failure(self):
-        class Probe:
-            def __init__(self,failures):self.failures=failures;self.calls=0
-            async def get(self,url):
-                self.calls+=1
-                if self.calls<=self.failures:raise httpx.RemoteProtocolError('peer closed idle connection')
-                return httpx.Response(200)
-        probe=Probe(1)
-        self.assertEqual(asyncio.run(main.probe_health(probe)),(True,200,None))
-        self.assertEqual(probe.calls,2)
-        probe=Probe(2);result=asyncio.run(main.probe_health(probe))
-        self.assertFalse(result[0]);self.assertIn('RemoteProtocolError',result[2])
-        self.assertEqual(probe.calls,2)
+    def test_concurrent_first_start(self):
+        root = self.root / "parallel"
+        admin, gateway = free_port(), free_port()
+        while gateway == admin:
+            gateway = free_port()
+        env = {**self.env, "MAVI_PLATFORM_ROOT": str(root), "MAVI_ADMIN_PORT": str(admin),
+               "MAVI_GATEWAY_PORT": str(gateway)}
+        processes = []
+        for role in ("admin", "gateway"):
+            process = subprocess.Popen([str(BACKEND), role], env=env)
+            self.addCleanup(self.stop_backend, process)
+            processes.append(process)
+        self.wait_for_backend(processes[0], admin, "/api/health")
+        self.wait_for_backend(processes[1], gateway, "/health")
+        auth = self.login(port=admin)
+        keys = request(admin, "GET", "/api/keys", headers=auth)[1]["keys"]
+        self.assertEqual(len(keys), 1)
+        key = request(admin, "GET", f"/api/keys/{keys[0]['id']}/reveal", headers=auth)[1]["value"]
+        self.assertEqual(request(gateway, "GET", "/v1/models", headers={"X-API-Key": key})[0], 200)
 
-class BytesStream(httpx.AsyncByteStream):
-    def __init__(self,chunks):self.chunks=chunks
-    async def __aiter__(self):
-        for chunk in self.chunks:yield chunk
 
-class GatewayTests(unittest.TestCase):
-    def setUp(self):
-        core.initialize();self.old=core.config();core.set_meta('config',{**self.old,'served_model_name':'unit-model','thinking_enabled':False})
-        self.key=core.first_key();self.headers={'Authorization':'Bearer '+self.key}
-        self.client=TestClient(gateway.app);self.client.__enter__();self.bodies=[]
-    def tearDown(self):
-        self.client.__exit__(None,None,None);core.set_meta('config',self.old)
-    def mock_backend(self,stream=False,error=False):
-        async def handler(request):
-            body=json.loads(request.content);self.bodies.append(body)
-            if stream:
-                events=[{'model':core.INTERNAL_MODEL,'choices':[{'delta':{'content':'hello'}}]},
-                        {'model':core.INTERNAL_MODEL,'choices':[],'usage':{'prompt_tokens':5,'completion_tokens':1}}]
-                if error:events.insert(1,{'error':{'message':'test error'}})
-                data=''.join('data: '+json.dumps(e)+'\n\n' for e in events)+'data: [DONE]\n\n'
-                return httpx.Response(200,headers={'content-type':'text/event-stream'},stream=BytesStream([data[:13].encode(),data[13:].encode()]))
-            return httpx.Response(200,json={'model':core.INTERNAL_MODEL,'choices':[{'message':{'content':'ok'}}],'usage':{'prompt_tokens':5,'completion_tokens':1}})
-        self.client.app.state.client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
-
-    def test_auth_and_allowlist(self):
-        self.assertEqual(self.client.get('/v1/models').status_code,401)
-        self.assertEqual(self.client.get('/v1/models',headers=self.headers).json()['data'][0]['id'],'unit-model')
-        self.assertEqual(self.client.post('/invocations',headers=self.headers).status_code,404)
-        self.assertEqual(self.client.get('/metrics',headers=self.headers).status_code,404)
-
-    def test_strict_thinking_and_model_alias(self):
-        self.mock_backend()
-        r=self.client.post('/v1/chat/completions',headers=self.headers,json={'model':'unit-model','messages':[{'role':'user','content':'x'}],'reasoning_effort':'high','chat_template_kwargs':{'enable_thinking':True}})
-        self.assertEqual(r.status_code,200)
-        self.assertEqual(r.json()['model'],'unit-model')
-        self.assertFalse(self.bodies[0]['chat_template_kwargs']['enable_thinking'])
-        self.assertEqual(self.bodies[0]['reasoning_effort'],'none')
-        self.assertEqual(self.bodies[0]['model'],core.INTERNAL_MODEL)
-        self.assertEqual(self.client.post('/v1/completions',headers=self.headers,json={'model':'unit-model','prompt':'<think>'}).status_code,400)
-
-    def test_sse_usage_and_errors(self):
-        self.mock_backend(stream=True)
-        r=self.client.post('/v1/chat/completions',headers=self.headers,json={'model':'unit-model','messages':[],'stream':True})
-        self.assertIn('unit-model',r.text);self.assertIn('[DONE]',r.text)
-        self.assertNotIn('prompt_tokens',r.text)
-        self.assertTrue(self.bodies[0]['stream_options']['include_usage'])
-        with core.connect() as c:row=dict(c.execute('SELECT * FROM requests ORDER BY created DESC LIMIT 1').fetchone())
-        self.assertEqual(row['output_tokens'],1);self.assertEqual(row['outcome'],'success')
-        self.mock_backend(stream=True,error=True)
-        self.client.post('/v1/chat/completions',headers=self.headers,json={'model':'unit-model','stream':True})
-        with core.connect() as c:row=dict(c.execute('SELECT * FROM requests ORDER BY created DESC LIMIT 1').fetchone())
-        self.assertEqual(row['outcome'],'error')
-
-    def test_responses_policy(self):
-        self.mock_backend()
-        r=self.client.post('/v1/responses',headers=self.headers,json={'model':'unit-model','input':'hi','reasoning':{'effort':'high'}})
-        self.assertEqual(r.status_code,200)
-        self.assertEqual(self.bodies[0]['reasoning']['effort'],'none')
-
-    def test_chunked_body_limit(self):
-        def huge_body():
-            for _ in range(26):yield b'x'*(1024*1024)
-        self.assertEqual(self.client.post('/v1/chat/completions',headers=self.headers,content=huge_body()).status_code,413)
-
-    def test_invalid_structures_do_not_raise_500(self):
-        for extra in [{'stream':'false'},{'stream_options':True},{'stream_options':{'include_usage':'yes'}},{'chat_template_kwargs':[]},{'n':100},{'best_of':10},{'use_beam_search':True},{'beam_width':8},{'max_tokens':999999}]:
-            r=self.client.post('/v1/chat/completions',headers=self.headers,json={'model':'unit-model',**extra})
-            self.assertEqual(r.status_code,400,extra)
-        r=self.client.post('/v1/chat/completions',headers=self.headers,content='{"model":"unit-model","temperature":NaN}')
-        self.assertEqual(r.status_code,400)
-        self.assertEqual(self.client.app.state.admitted,0)
-        with core.connect() as c:
-            row=c.execute('SELECT status,outcome FROM requests ORDER BY created DESC LIMIT 1').fetchone()
-        self.assertEqual(tuple(row),(400,'error'))
-
-    def test_admission_rejection_and_release(self):
-        limit=min(16,core.get_meta('applied_config',core.config())['concurrency']+6)
-        self.client.app.state.admitted=limit
-        r=self.client.post('/v1/chat/completions',headers=self.headers,json={'model':'unit-model'})
-        self.assertEqual(r.status_code,429);self.assertEqual(r.headers['retry-after'],'3')
-        self.assertEqual(self.client.app.state.admitted,limit)
-        self.client.app.state.admitted=0
-        self.mock_backend(stream=True)
-        self.client.post('/v1/chat/completions',headers=self.headers,json={'model':'unit-model','stream':True})
-        self.assertEqual(self.client.app.state.admitted,0)
-
-    def test_disconnect_before_stream_headers_releases_admission(self):
-        self.mock_backend(stream=True)
-        async def exercise():
-            body=json.dumps({'model':'unit-model','stream':True}).encode()
-            scope={'type':'http','method':'POST','path':'/v1/chat/completions','headers':[(b'authorization',('Bearer '+self.key).encode())],'app':gateway.app,'asgi':{'spec_version':'2.4'}}
-            async def receive():return {'type':'http.request','body':body,'more_body':False}
-            request=Request(scope,receive)
-            response=await gateway.inference('chat/completions',request)
-            self.assertEqual(gateway.app.state.admitted,1)
-            async def send(message):raise asyncio.CancelledError()
-            with self.assertRaises(asyncio.CancelledError):await response(scope,receive,send)
-        asyncio.run(exercise())
-        self.assertEqual(gateway.app.state.admitted,0)
-        with core.connect() as c:row=c.execute('SELECT outcome FROM requests ORDER BY created DESC LIMIT 1').fetchone()
-        self.assertEqual(row['outcome'],'cancelled')
-
-if __name__=='__main__':unittest.main(verbosity=2)
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

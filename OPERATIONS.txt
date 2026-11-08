@@ -43,6 +43,7 @@ API 客户端使用 model=liuxing。请求使用旧模型名时会返回 HTTP 40
 
 服务与文件
 程序目录：/home/mavi/mavi-vllm-platform
+C++ 后台二进制：/usr/local/bin/mavi-vllm-backend（admin、gateway、engine 三个模式）
 数据库与私密配置：/home/mavi/mavi-vllm-platform/data
 模型权重：/home/mavi/inference/models/liuxing
 GGUF 文件：liuxing-UD-Q4_K_M.gguf、mmproj-liuxing-BF16.gguf、mtp-liuxing-Q4_0.gguf
@@ -59,7 +60,8 @@ ssh ubuntu-mavi "journalctl -u mavi-vllm-gateway -n 100 --no-pager"
 ssh ubuntu-mavi "journalctl -u qwen3.8-vllm -n 100 --no-pager"
 
 测试
-后端隔离测试：/home/mavi/inference/venv-vllm/bin/python tests/test_platform.py
+后端隔离测试：按 README 构建后执行 ctest --test-dir build --output-on-failure。
+可执行文件替换后，现有 SQLite 和 secret.key 可直接使用；真实 GPU 验收需要在目标主机重新执行。
 量化加载一致性测试：/home/mavi/inference/venv-vllm/bin/python tests/test_loader_memory.py
 前端 DOM 交互测试：npm run test:ui（开发环境，npm ci 后运行）
 真实模型集成验收：data/integration-validation.json。

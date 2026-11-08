@@ -59,7 +59,22 @@ curl "$MAVI_BASE_URL/chat/completions" \
 
 ## 部署与运维
 
-本项目的部署脚本面向已准备好 vLLM、兼容的 GGUF 加载组件、模型权重和 systemd 推理服务的 Ubuntu 主机。模型权重和 Python 运行环境需单独准备。脚本中的用户、目录和服务名来自原部署，迁移前请核对这些设置。
+管理服务和 API 网关使用同一个 C++20 可执行文件，以独立的 systemd 服务运行。模型由 vLLM 的 Python 环境加载。部署脚本面向已准备好 NVIDIA 驱动、vLLM、兼容的 GGUF 加载组件、模型权重和 systemd 推理服务的 Ubuntu 主机。
+
+### 构建与隔离测试
+
+```bash
+sudo apt install build-essential cmake libboost-dev libssl-dev libsqlite3-dev nlohmann-json3-dev
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel 2
+ctest --test-dir build --output-on-failure
+```
+
+后台测试用 Python 3 启动本地 C++ 进程和模拟推理服务。安装 `python3-cryptography` 可额外验证与旧版 SQLite 密钥的双向兼容。测试在临时目录运行。
+
+### 安装或升级
+
+核对脚本中的用户、目录和服务名。升级前备份三个服务单元和现有 `data/platform.sqlite3`、`data/secret.key`。在目标主机的应用目录执行 `sudo bash scripts/install-system.sh`，脚本构建并安装二进制，然后切换服务入口。既有数据库及密钥格式可以直接沿用。升级会短暂中断请求，并按升级前状态决定是否重新启动模型。
 
 - [运维说明](OPERATIONS.txt)记录模型文件、服务路径、配置范围和验证方式。
 - [systemd 部署脚本](scripts/install-system.sh)配置管理网页、API 网关和推理服务。

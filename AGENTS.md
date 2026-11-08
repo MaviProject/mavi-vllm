@@ -1,6 +1,6 @@
 # mavi-vllm 项目指引
 
-mavi-vllm 是运行在 Ubuntu 单机上的 vLLM 管理平台。技术栈为 Python 3.12 部署环境、FastAPI/Pydantic v2、Uvicorn、httpx、SQLite WAL、原生 HTML/CSS/JavaScript、systemd 和 NVIDIA GPU 上的 vLLM/GGUF。Node.js 用于 jsdom 前端测试。
+mavi-vllm 是运行在 Ubuntu 单机上的 vLLM 管理平台。后台用 C++20、Boost.Asio/Beast、SQLite WAL 和 OpenSSL，构建入口为 `CMakeLists.txt`。前端使用原生 HTML/CSS/JavaScript。systemd 分别运行管理服务、网关及 NVIDIA GPU 上的 vLLM/GGUF 推理。Python venv 用于 vLLM 和运维，Node.js 用于 jsdom 测试。
 
 ## 任务路由
 
@@ -8,10 +8,10 @@ mavi-vllm 是运行在 Ubuntu 单机上的 vLLM 管理平台。技术栈为 Pyth
 
 | 主任务 | 读取 | 源码入口 |
 | --- | --- | --- |
-| 管理页面、登录、配置表单、API Key 管理、在线调试、日志与 CSV | [mavi-console](skills/mavi-console/SKILL.md) | `static/`、`backend/main.py` |
-| OpenAI 兼容 API、模型别名、限流、思考策略、SSE 与请求统计 | [mavi-gateway](skills/mavi-gateway/SKILL.md) | `backend/gateway.py`、`backend/streaming.py` |
-| 模型启动与启停、并发/上下文、KV 容量、GPU 指标、GGUF/MTP | [mavi-inference](skills/mavi-inference/SKILL.md) | `backend/engine_launcher.py`、`backend/core.py`、`backend/main.py` |
-| 编写或选择测试、回归验证、定位测试失败 | [mavi-test](skills/mavi-test/SKILL.md) | `tests/`、`package.json` |
+| 管理页面、登录、配置表单、API Key 管理、在线调试、日志与 CSV | [mavi-console](skills/mavi-console/SKILL.md) | `static/`、`backend/admin.cpp` |
+| OpenAI 兼容 API、模型别名、限流、思考策略、SSE 与请求统计 | [mavi-gateway](skills/mavi-gateway/SKILL.md) | `backend/gateway.cpp`、`backend/http.cpp` |
+| 模型启动与启停、并发/上下文、KV 容量、GPU 指标、GGUF/MTP | [mavi-inference](skills/mavi-inference/SKILL.md) | `backend/runtime.cpp`、`backend/store.cpp` |
+| 编写或选择测试、回归验证、定位测试失败 | [mavi-test](skills/mavi-test/SKILL.md) | `tests/`、`CMakeLists.txt`、`package.json` |
 | 安装、迁移、升级、回滚、systemd/防火墙/桌面自启 | [mavi-deploy](skills/mavi-deploy/SKILL.md) | `scripts/install-system.sh`、`OPERATIONS.txt` |
 
 - 配置表单改到容量校验或重载时，补读推理技能。在线调试改到 SSE、模型别名或请求策略时，补读网关技能。
@@ -21,15 +21,15 @@ mavi-vllm 是运行在 Ubuntu 单机上的 vLLM 管理平台。技术栈为 Pyth
 
 | 默认监听 | 入口 | 职责 |
 | --- | --- | --- |
-| `0.0.0.0:20204` | `backend/main.py`，`main:app` | 管理网页、`/api/*`、系统服务控制和监控 |
-| `0.0.0.0:80` | `backend/gateway.py`，`gateway:app` | 外部 `/v1/*`、API Key 验证、请求策略和用量 |
-| `127.0.0.1:8000` | `backend/engine_launcher.py` → `vllm serve` | 真实模型推理及 `/health`、`/metrics` |
+| `0.0.0.0:20204` | `mavi-backend admin` | 管理网页、`/api/*`、系统服务控制和监控 |
+| `0.0.0.0:80` | `mavi-backend gateway` | 外部 `/v1/*`、API Key 验证、请求策略和用量 |
+| `127.0.0.1:8000` | `mavi-backend engine` → `vllm serve` | 真实模型推理及 `/health`、`/metrics` |
 
-管理在线调试走 `浏览器 → /api/playground → 网关 → vLLM`。`backend/core.py` 维护共享配置、鉴权数据、容量建议与统计。`MAVI_PLATFORM_ROOT` 决定应用根目录，默认从源码位置解析。`data/` 保存 SQLite 库、加密密钥和验收产物。
+管理在线调试走 `浏览器 → /api/playground → 网关 → vLLM`。`backend/store.cpp` 维护共享配置、鉴权数据、容量建议与统计。`MAVI_PLATFORM_ROOT` 决定应用根目录，默认使用进程工作目录。`data/` 保存 SQLite 库、加密密钥和验收产物。
 
 ## 修改与验证
 
 - 以源码、测试和部署脚本判断当前行为。`README.md` 提供产品概览，`OPERATIONS.txt` 记录原部署参数与验收快照。现场配置以目标主机为准。
 - 保持管理请求同源、网关鉴权和原生推理回环监听。涉及协议或数据变更时检查现有调用方及已有 SQLite 数据。
-- 隔离验证优先用 `python tests/test_platform.py` 和 `npm ci` 后的 `npm run test:ui`，按改动选用。真实部署、故障注入、重载和压测需以任务授权的目标及维护范围为准。
-- `data/`、`backups/` 和 `node_modules/` 是本地产物。保护密码、完整 API Key、`secret.key`、提示词和图片，避免将其写入日志、测试夹具或提交。
+- 后台先用 CMake 构建，再运行 `ctest --test-dir build --output-on-failure`。前端使用 `npm ci` 后的 `npm run test:ui`。真实部署、故障注入、重载和压测需以任务授权的目标及维护范围为准。
+- `build/`、`data/`、`backups/` 和 `node_modules/` 是本地产物。保护密码、完整 API Key、`secret.key`、提示词和图片，避免将其写入日志、测试夹具或提交。
